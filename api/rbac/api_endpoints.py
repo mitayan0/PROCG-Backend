@@ -1,0 +1,257 @@
+from flask import request, jsonify, make_response
+from sqlalchemy import or_
+from datetime import datetime
+from flask_jwt_extended import jwt_required, get_jwt_identity
+
+from executors.extensions import db
+from executors.models import (
+    DefPrivilege,
+    DefApiEndpoint,
+    DefApiEndpointRole
+)
+
+from utils.auth import role_required
+from utils.rbac_scan import scan_unregistered_endpoints
+
+from . import rbac_bp
+
+
+
+
+@rbac_bp.route('/def_api_endpoints', methods=['POST'])
+@jwt_required()
+@role_required()
+def create_api_endpoint():
+    try:
+        api_endpoint = request.json.get('api_endpoint')
+        api_name = request.json.get('api_name')
+        parameters = request.json.get('parameters')
+        method = request.json.get('method')
+        privilege_id = request.json.get('privilege_id')
+
+        # Normalize method casing to match request.method comparisons in role_required
+        if method:
+            method = method.upper()
+
+        # Parameter validation
+        if parameters is not None:
+            if not isinstance(parameters, list):
+                return make_response(jsonify({'error': 'Parameters must be a list of objects.'}), 400)
+            
+            required_keys = {"name", "type", "location", "required"}
+            for param in parameters:
+                if not isinstance(param, dict):
+                    return make_response(jsonify({'error': 'Each parameter must be a JSON object.'}), 400)
+                if not required_keys.issubset(param.keys()):
+                    return make_response(jsonify({'error': f'Missing required keys in parameter. Must contain: {required_keys}'}), 400)
+                if not isinstance(param.get("required"), bool):
+                    return make_response(jsonify({'error': "'required' field must be a boolean."}), 400)
+
+        # FK validation
+        if privilege_id and not DefPrivilege.query.filter_by(privilege_id=privilege_id).first():
+            return make_response(jsonify({'error': 'privilege_id not found'}), 404)
+
+        # Duplicate check: one catalog row per (api_endpoint, method)
+        if api_endpoint and method and DefApiEndpoint.query.filter_by(
+            api_endpoint=api_endpoint,
+            method=method
+        ).first():
+            return make_response(jsonify({
+                'error': f'API endpoint [{method}] {api_endpoint} is already registered'
+            }), 409)
+
+        new_api = DefApiEndpoint(
+            api_endpoint=api_endpoint,
+            api_name=api_name,
+            parameters=parameters,
+            method=method,
+            privilege_id=privilege_id,
+            created_by     = get_jwt_identity(),
+            creation_date  = datetime.utcnow(),
+            last_updated_by = get_jwt_identity(),
+            last_update_date = datetime.utcnow()
+        )
+
+        db.session.add(new_api)
+        db.session.commit()
+
+        return make_response(jsonify({
+            'message': 'Added successfully',
+            'api_endpoint_id': new_api.api_endpoint_id
+        }), 201)
+
+    except Exception as e:
+        db.session.rollback()
+        return make_response(jsonify({"error": str(e)}), 500)
+
+
+
+
+
+@rbac_bp.route('/def_api_endpoints', methods=['GET'])
+@jwt_required()
+@role_required()
+def get_api_endpoints():
+    try:
+        api_endpoint_id = request.args.get("api_endpoint_id", type=int)
+
+        # Single-record lookup if api_endpoint_id is provided
+        if api_endpoint_id is not None:
+            endpoint = DefApiEndpoint.query.filter_by(api_endpoint_id=api_endpoint_id).first()
+            if not endpoint:
+                return make_response(jsonify({
+                    "error": f"API endpoint with id={api_endpoint_id} not found"
+                }), 404)
+            return make_response(jsonify({"result": endpoint.json()}), 200)
+
+        unregistered = (request.args.get('unregistered') or '').lower() in ('true', '1')
+        unassigned = (request.args.get('unassigned') or '').lower() in ('true', '1')
+
+        if unregistered and unassigned:
+            return make_response(jsonify({
+                "error": "'unassigned' and 'unregistered' filters are mutually exclusive"
+            }), 400)
+
+        if unregistered:
+            return make_response(jsonify(scan_unregistered_endpoints()), 200)
+
+        # Base query
+        query = DefApiEndpoint.query
+
+        if unassigned:
+            query = query.outerjoin(
+                DefApiEndpointRole,
+                DefApiEndpoint.api_endpoint_id == DefApiEndpointRole.api_endpoint_id
+            ).filter(DefApiEndpointRole.role_id.is_(None))
+
+        # Search filter
+        search_term = request.args.get('api_endpoint', '').strip()
+        if search_term:
+            search_underscore = search_term.replace(' ', '_')
+            search_space = search_term.replace('_', ' ')
+            query = query.filter(
+                or_(
+                    DefApiEndpoint.api_endpoint.ilike(f'%{search_term}%'),
+                    DefApiEndpoint.api_endpoint.ilike(f'%{search_underscore}%'),
+                    DefApiEndpoint.api_endpoint.ilike(f'%{search_space}%'),
+                    DefApiEndpoint.api_name.ilike(f'%{search_term}%'),
+                    DefApiEndpoint.api_name.ilike(f'%{search_underscore}%'),
+                    DefApiEndpoint.api_name.ilike(f'%{search_space}%')
+                )
+            )
+
+        # Ordering
+        query = query.order_by(DefApiEndpoint.api_endpoint_id.desc())
+
+        # Pagination
+        page = request.args.get('page', type=int)
+        limit = request.args.get('limit', type=int)
+
+        if page and limit:
+            paginated = query.paginate(page=page, per_page=limit, error_out=False)
+            return make_response(jsonify({
+                "result": [e.json() for e in paginated.items],
+                "total": paginated.total,
+                "pages": paginated.pages,
+                "page": paginated.page
+            }), 200)
+
+        # Otherwise return all endpoints
+        endpoints = query.all()
+        return make_response(jsonify({"result": [e.json() for e in endpoints]}), 200)
+
+    except Exception as e:
+        return make_response(jsonify({
+            "error": str(e),
+            "message": "Error fetching API endpoints"
+        }), 500)
+    
+@rbac_bp.route('/def_api_endpoints', methods=['PUT'])
+@jwt_required()
+@role_required()
+def update_api_endpoint():
+    try:
+        api_endpoint_id = request.args.get("api_endpoint_id", type=int)
+
+        # Validate required param
+        if api_endpoint_id is None:
+            return make_response(jsonify({
+                "error": "Query parameter 'api_endpoint_id' is required"
+            }), 400)
+        
+        row = DefApiEndpoint.query.filter_by(api_endpoint_id=api_endpoint_id).first()
+        if not row:
+            return make_response(jsonify({'error': 'API endpoint not found'}), 404)
+
+        row.api_endpoint = request.json.get('api_endpoint', row.api_endpoint)
+        row.api_name = request.json.get('api_name', row.api_name)
+        row.parameters = request.json.get('parameters', row.parameters)
+        row.method = request.json.get('method', row.method)
+
+        privilege_id = request.json.get('privilege_id', row.privilege_id)
+        if privilege_id and not DefPrivilege.query.filter_by(privilege_id=privilege_id).first():
+            return make_response(jsonify({'error': 'privilege_id not found'}), 404)
+        row.privilege_id = privilege_id
+
+        row.last_updated_by = get_jwt_identity()
+        row.last_update_date = datetime.utcnow()
+
+        db.session.commit()
+        return make_response(jsonify({'message': 'Edited successfully'}), 200)
+
+    except Exception as e:
+        db.session.rollback()
+        return make_response(jsonify({"error": str(e)}), 500)
+
+
+
+@rbac_bp.route('/def_api_endpoints', methods=['DELETE'])
+@jwt_required()
+@role_required()
+def delete_api_endpoint():
+    try:
+        # Enforce JSON body for bulk deletions
+        data = request.get_json(silent=True)
+        
+        if not data or 'api_endpoint_ids' not in data:
+            return make_response(jsonify({
+                "error": "JSON body with 'api_endpoint_ids' (list of IDs) is required"
+            }), 400)
+
+        ids = data['api_endpoint_ids']
+        
+        if not isinstance(ids, list):
+            # If a single ID was passed instead of a list, wrap it in a list
+            ids = [ids]
+
+        if not ids:
+            return make_response(jsonify({"error": "'api_endpoint_ids' list cannot be empty"}), 400)
+        
+        # 1. DELETE FROM def_api_endpoint_roles first to avoid ForeignKeyViolation
+        DefApiEndpointRole.query.filter(DefApiEndpointRole.api_endpoint_id.in_(ids)).delete(synchronize_session=False)
+
+        # 2. Get and delete the actual endpoints
+        rows = DefApiEndpoint.query.filter(DefApiEndpoint.api_endpoint_id.in_(ids)).all()
+        
+        if not rows:
+            # If we don't find any endpoints, we should still commit the role deletion just in case
+            db.session.commit()
+            return make_response(jsonify({'error': 'No matching API endpoints found for the provided ID(s)'}), 404)
+
+        deleted_count = 0
+        for row in rows:
+            db.session.delete(row)
+            deleted_count += 1
+            
+        db.session.commit()
+
+        return make_response(jsonify({
+            'message': 'Deleted successfully',
+            'deleted_count': deleted_count
+        }), 200)
+
+    except Exception as e:
+        db.session.rollback()
+        return make_response(jsonify({"error": str(e)}), 500)
+
+

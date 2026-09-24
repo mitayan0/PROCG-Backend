@@ -1,0 +1,539 @@
+from flask import request, jsonify, make_response
+from flask_jwt_extended import jwt_required, get_jwt_identity
+from datetime import datetime
+from sqlalchemy import or_, func
+
+from utils.auth import resolve_tenant_id, role_required
+from executors.extensions import db
+from executors.models import (
+    DefActionItem,
+    DefActionItemAssignment,
+    DefNotifications,
+    DefActionItemsV,
+    DefExecutionActionItems,
+    DefProcessExecution
+
+)
+from . import action_items_bp
+from workflow_engine.tasks import resume_workflow_task
+
+# Create a DefActionItem
+
+
+
+# Get all DefActionItems (Consolidated Endpoint)
+@action_items_bp.route('/def_action_items', methods=['GET'])
+@jwt_required()
+@role_required()
+def get_action_items():
+    try:
+        # Query Parameters
+        action_item_id = request.args.get('action_item_id', type=int)
+        user_id = request.args.get('user_id', type=int)
+        page = request.args.get('page', type=int)
+        limit = request.args.get('limit', type=int)
+        status = request.args.get('status')
+        action_item_name = request.args.get('action_item_name', '').strip()
+
+        # 1. Single Item by ID
+        if action_item_id:
+            action_item = DefActionItem.query.filter_by(action_item_id=action_item_id).first()
+            if action_item:
+                return make_response(jsonify({"result": action_item.json()}), 200)
+            else:
+                return make_response(jsonify({"message": "Action item not found"}), 404)
+
+        # 2. List Items (User View or Admin/General View)
+        if user_id:
+            # User View: Filter by user_id and notification_status='sent'
+            query = DefActionItemsV.query.filter_by(user_id=user_id).filter(
+                or_(
+                    func.lower(func.trim(DefActionItemsV.notification_status)) == "sent",
+                    DefActionItemsV.notification_status.is_(None)
+                )
+            )
+            
+            # Additional filters for User View
+            if status:
+                query = query.filter(
+                    func.lower(func.trim(DefActionItemsV.status)) == func.lower(func.trim(status))
+                )
+
+            if action_item_name:
+                search_underscore = action_item_name.replace(' ', '_')
+                search_space = action_item_name.replace('_', ' ')
+                query = query.filter(
+                    or_(
+                        DefActionItemsV.action_item_name.ilike(f'%{action_item_name}%'),
+                        DefActionItemsV.action_item_name.ilike(f'%{search_underscore}%'),
+                        DefActionItemsV.action_item_name.ilike(f'%{search_space}%')
+                    )
+                )
+            
+            query = query.order_by(DefActionItemsV.action_item_id.desc())
+            
+        else:
+            # General View (Admin or all items)
+            query = DefActionItemsV.query.order_by(DefActionItemsV.action_item_id.desc())
+
+        # 3. Pagination
+        if page and limit:
+            paginated = query.paginate(page=page, per_page=limit, error_out=False)
+            return make_response(jsonify({
+                "result": [item.json() for item in paginated.items],
+                "total": paginated.total,
+                "pages": paginated.pages,
+                "page": paginated.page
+            }), 200)
+
+        # 4. Return All (No Pagination)
+        items = query.all()
+        return make_response(jsonify({
+            "result": [item.json() for item in items]
+        }), 200)
+
+    except Exception as e:
+        return make_response(jsonify({"message": "Error retrieving action items", "error": str(e)}), 500)
+
+
+
+
+@action_items_bp.route('/def_action_items', methods=['POST'])
+@jwt_required()
+@role_required()
+def create_action_item():
+    try:
+        action_item_name = request.json.get('action_item_name')
+        description = request.json.get('description')
+        notification_id = request.json.get('notification_id')
+        user_ids = request.json.get('user_ids')
+        action = request.json.get('action')
+
+        created_by = get_jwt_identity()
+
+        if not action_item_name:
+            return make_response(jsonify({"message": "Action item name is required"}), 400)
+
+        # existing_item = DefActionItem.query.filter_by(action_item_name=action_item_name).first()
+        # if existing_item:
+        #     return make_response(jsonify({"message": "Action item name already exists"}), 400)
+
+        # if notification_id:
+        #     # Optionally validate if notification exists
+        #     notification = db.session.query(DefNotification.notification_id).filter_by(notification_id=notification_id).first()
+        #     if not notification:
+        #         return make_response(jsonify({"message": "Invalid notification_id"}), 400)
+
+        new_action_item = DefActionItem(
+            action_item_name = action_item_name,
+            description = description,
+            created_by = created_by,
+            creation_date = datetime.utcnow(),
+            last_updated_by = created_by,
+            last_update_date = datetime.utcnow(),
+            notification_id = notification_id
+        )
+
+        db.session.add(new_action_item)
+        db.session.flush()  # so we get the ID
+
+        # Add assignments (tenant denormalised for RLS)
+        if new_action_item:
+
+            for uid in user_ids:
+                assignment = DefActionItemAssignment(
+                    action_item_id = new_action_item.action_item_id,
+                    user_id = uid,
+                    tenant_id = resolve_tenant_id(uid),
+                    status = 'NEW',
+                    created_by = get_jwt_identity(),
+                    # creation_date = datetime.utcnow(),
+                    last_updated_by = get_jwt_identity(),
+                    # last_update_date = datetime.utcnow()
+                )
+                db.session.add(assignment)
+
+    #update action_item_id in def_notifications table
+        if new_action_item:
+            notification = DefNotifications.query.filter_by(notification_id=notification_id).first()
+            if notification:
+                notification.action_item_id = new_action_item.action_item_id
+            
+
+
+        db.session.commit()
+
+        if action == 'DRAFT':
+            return make_response(jsonify({
+                'message': 'Action item saved successfully',
+                'result': new_action_item.json()
+
+            }), 201)
+
+        if action == 'SENT':
+            return make_response(jsonify({
+                'message': 'Action item sent successfully',
+                'result': new_action_item.json()
+            }), 201)
+
+
+    except Exception as e:
+        db.session.rollback()
+        return make_response(jsonify({"message": "Error creating action item", "error": str(e)}), 500)
+
+
+
+
+@action_items_bp.route('/def_action_items/upsert', methods=['POST'])
+@jwt_required()
+@role_required()
+def upsert_action_item():
+    data = request.get_json()
+    if not data:
+        return jsonify({"message": "Invalid request: No JSON data provided"}), 400
+
+    try:
+        action_item_id = data.get('action_item_id')
+        user_ids = data.get('user_ids', [])
+        status = data.get('status')
+        current_user = get_jwt_identity()
+
+        if action_item_id:
+            # --- UPDATE ---
+            action_item = db.session.get(DefActionItem, action_item_id)
+            if not action_item:
+                return jsonify({"message": f"Action Item with ID {action_item_id} not found"}), 404
+
+            #Check duplicate name if changing
+            # new_name = data.get('action_item_name')
+            # if new_name and new_name != action_item.action_item_name:
+            #     duplicate = DefActionItem.query.filter_by(action_item_name=new_name).first()
+            #     if duplicate:
+            #         return jsonify({"message": "Action item name already exists"}), 400
+            #     action_item.action_item_name = new_name
+
+            if "action_item_name" in data:
+                action_item.action_item_name = data["action_item_name"]
+
+            if "description" in data:
+                action_item.description = data["description"]
+            if "notification_id" in data:
+                action_item.notification_id = data["notification_id"]
+
+            action_item.last_updated_by = current_user
+            message = "Edited successfully"
+            status_code = 200
+
+        else:
+            # --- CREATE ---
+            action_item_name = data.get('action_item_name')
+            if not action_item_name:
+                return jsonify({"message": "Missing required field: action_item_name"}), 400
+
+            # Check duplicate name before insert
+            # duplicate = DefActionItem.query.filter_by(action_item_name=action_item_name).first()
+            # if duplicate:
+            #     return jsonify({"message": "Action item name already exists"}), 400
+
+            action_item = DefActionItem(
+                action_item_name = action_item_name,
+                description = data.get('description'),
+                created_by = current_user,
+                creation_date = datetime.utcnow(),
+                last_updated_by = current_user,
+                last_update_date = datetime.utcnow(),
+                notification_id = data.get('notification_id')
+            )
+            db.session.add(action_item)
+            db.session.flush()  # get the ID before assignments
+            message = "Added successfully"
+            status_code = 201
+
+        db.session.commit()
+
+        # Handle user assignments
+        if user_ids:
+            # Remove old assignments if updating
+            if action_item_id:
+                DefActionItemAssignment.query.filter_by(action_item_id=action_item.action_item_id).delete()
+
+
+            for uid in user_ids:
+                assignment = DefActionItemAssignment(
+                    action_item_id=action_item.action_item_id,
+                    user_id=uid,
+                    tenant_id=resolve_tenant_id(uid),
+                    status=status,
+                    created_by=current_user,
+                    last_updated_by=current_user
+                )
+                db.session.add(assignment)
+
+            db.session.commit()
+
+        return make_response(jsonify({
+            "message": message,
+            "action_item_id": action_item.action_item_id
+        }), status_code)
+
+    except Exception as e:
+        db.session.rollback()
+        return jsonify({"message": "An unexpected error occurred", "error": str(e)}), 500
+
+
+
+@action_items_bp.route('/def_action_items', methods=['PUT'])
+@jwt_required()
+@role_required()
+def update_action_item():
+    try:
+        action_item_id = request.args.get('action_item_id', type=int)
+        if not action_item_id:
+            return make_response(jsonify({'message': 'action_item_id query parameter is required'}), 400)
+
+        data = request.get_json()
+        current_user = get_jwt_identity()
+
+        action_item_name = data.get('action_item_name')
+        description = data.get('description')
+        notification_id = data.get('notification_id')
+        user_ids = data.get('user_ids', [])
+        action = data.get('action')
+        
+
+        # --- Update DefActionItem main record ---
+        action_item = DefActionItem.query.get(action_item_id)
+        if not action_item:
+            return make_response(jsonify({'message': 'Action Item not found'}), 404)
+
+        if action_item_name:
+            action_item.action_item_name = action_item_name
+        if description:
+            action_item.description = description
+        if notification_id:
+            action_item.notification_id = notification_id
+
+        action_item.last_updated_by = current_user
+        action_item.last_update_date = datetime.utcnow()
+
+        db.session.commit()
+
+        # --- Handle DefActionItemAssignment sync ---
+        existing_assignments = DefActionItemAssignment.query.filter_by(
+            action_item_id=action_item_id
+        ).all()
+        existing_user_ids = {a.user_id for a in existing_assignments}
+        incoming_user_ids = set(map(int, user_ids))
+
+        # Find differences
+        users_to_add = incoming_user_ids - existing_user_ids
+        users_to_update = incoming_user_ids & existing_user_ids
+        users_to_delete = existing_user_ids - incoming_user_ids
+
+        # Add new recipients
+        for uid in users_to_add:
+            new_assignment = DefActionItemAssignment(
+                action_item_id=action_item_id,
+                user_id=uid,
+                status='NEW',
+                created_by=current_user,
+                last_updated_by=current_user
+            )
+            db.session.add(new_assignment)
+
+        # Update existing recipients
+        for uid in users_to_update:
+            assignment = DefActionItemAssignment.query.filter_by(
+                action_item_id=action_item_id,
+                user_id=uid
+            ).first()
+            if assignment:
+                assignment.last_updated_by = current_user
+                assignment.last_update_date = datetime.utcnow()
+
+        # Delete removed recipients
+        if users_to_delete:
+            DefActionItemAssignment.query.filter(
+                DefActionItemAssignment.action_item_id == action_item_id,
+                DefActionItemAssignment.user_id.in_(users_to_delete)
+            ).delete(synchronize_session=False)
+
+        db.session.commit()
+
+        if action == 'DRAFT':
+            return make_response(jsonify({
+                'message': 'Action item saved successfully',
+                'result': action_item.json()
+            }), 200)
+
+        if action == 'SENT':
+            return make_response(jsonify({
+                'message': 'Action item sent successfully',
+                'result': action_item.json()
+            }), 200)
+
+    except Exception as e:
+        db.session.rollback()
+        return make_response(jsonify({'error': str(e)}), 500)
+
+
+
+
+# Delete a DefActionItem
+@action_items_bp.route('/def_action_items/<int:action_item_id>', methods=['DELETE'])
+@jwt_required()
+@role_required()
+def delete_action_item(action_item_id):
+    try:
+        action_item = DefActionItem.query.filter_by(action_item_id=action_item_id).first()
+        if not action_item:
+            return make_response(jsonify({"message": "Action item not found"}), 404)
+
+        # First delete all related assignments
+        DefActionItemAssignment.query.filter_by(action_item_id=action_item_id).delete()
+
+        # Then delete the main action item
+        db.session.delete(action_item)
+        db.session.commit()
+
+        return make_response(jsonify({"message": "Deleted successfully"}), 200)
+
+    except Exception as e:
+        db.session.rollback()
+        return make_response(jsonify({"message": "Error deleting action item", "error": str(e)}), 500)
+
+
+
+
+
+
+
+@action_items_bp.route('/def_action_items', methods=['DELETE'])
+@jwt_required()
+@role_required()
+def delete_multiple_action_items():
+    try:
+        data = request.get_json()
+
+        if not data or "action_item_ids" not in data:
+            return make_response(jsonify({
+                "message": "JSON payload with 'action_item_ids' list is required"
+            }), 400)
+
+        action_item_ids = data.get("action_item_ids")
+
+        if not isinstance(action_item_ids, list) or not all(isinstance(i, int) for i in action_item_ids):
+            return make_response(jsonify({
+                "message": "'action_item_ids' must be a list of integers"
+            }), 400)
+
+        if not action_item_ids:
+            return make_response(jsonify({
+                "message": "The 'action_item_ids' list cannot be empty"
+            }), 400)
+
+        # 1. Delete assignments first (manual cascade)
+        DefActionItemAssignment.query.filter(
+            DefActionItemAssignment.action_item_id.in_(action_item_ids)
+        ).delete(synchronize_session=False)
+
+        # 2. Delete the main action items
+        deleted_count = DefActionItem.query.filter(
+            DefActionItem.action_item_id.in_(action_item_ids)
+        ).delete(synchronize_session=False)
+
+        if deleted_count == 0:
+            db.session.rollback()
+            return make_response(jsonify({
+                "message": "No action items found for the provided IDs"
+            }), 404)
+
+        db.session.commit()
+
+        return make_response(jsonify({
+            "message": "Deleted successfully",
+            "deleted_ids": action_item_ids
+        }), 200)
+
+    except Exception as e:
+        db.session.rollback()
+        return make_response(jsonify({
+            "message": "Error deleting action items",
+            "error": str(e)
+        }), 500)
+
+
+# Update DefActionItemAssignments (replace user_ids for given action_item_id)
+@action_items_bp.route('/def_action_items/update_status/<int:user_id>/<int:action_item_id>', methods=['PUT'])
+@jwt_required()
+@role_required()
+def update_action_item_assignment_status(user_id, action_item_id):
+    try:
+        data = request.get_json()
+        if not data or 'status' not in data:
+            return make_response(jsonify({"message": "Missing required field: status"}), 400)
+
+        # Fetch the assignment
+        assignment = DefActionItemAssignment.query.filter_by(
+            action_item_id=action_item_id,
+            user_id=user_id
+        ).first()
+
+        if not assignment:
+            return make_response(jsonify({"message": "Assignment not found"}), 404)
+
+        # Update only the status
+        assignment.status = data['status']
+        assignment.last_updated_by = get_jwt_identity()
+        assignment.last_update_date = datetime.utcnow()
+
+        db.session.commit()
+
+        # Check if linked to a workflow execution
+        workflow_link = DefExecutionActionItems.query.filter_by(
+            action_item_id=action_item_id
+        ).first()
+
+        response = {
+            "message":        "Status Updated Successfully",
+            "action_item_id": action_item_id,
+            "status":         data['status'],
+            "user_id":        user_id
+        }
+
+        if workflow_link:
+            # Store the response data back on the link record
+            workflow_link.response_data = {
+                "status":       data['status'],
+                "responded_by": user_id,
+                "responded_at": datetime.utcnow().isoformat()
+            }
+            workflow_link.last_updated_by = get_jwt_identity()
+            workflow_link.last_update_date = datetime.utcnow()
+            db.session.commit()
+
+            _exec = db.session.get(DefProcessExecution, workflow_link.execution_id)
+            resume_workflow_task.delay(
+                workflow_link.execution_id,
+                {
+                    "predictable_result":             data['status'],
+                    f"{workflow_link.node_id}_result": data['status'],
+                    "responded_by":                   user_id
+                },
+                tenant_id=getattr(_exec, 'tenant_id', None),
+                user_id=getattr(_exec, 'created_by', None),
+                is_admin=False,
+            )
+
+            response["workflow_link"] = {
+                "execution_id":  workflow_link.execution_id,
+                "node_id":       workflow_link.node_id,
+                "response_data": workflow_link.response_data
+            }
+
+        return make_response(jsonify(response), 200)
+
+    except Exception as e:
+        db.session.rollback()
+        return make_response(jsonify({"message": "Error updating status", "error": str(e)}), 500)
+
