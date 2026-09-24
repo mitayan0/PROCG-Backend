@@ -1,0 +1,194 @@
+# PROCG (Proactive Controls and Governance) Backend
+
+**PRO-CG is a Robust, Reliable and Secure System of Record designed to deliver actionable Insights and meet the complex needs of Modern Enterprises, Multinational Organizations, Government Agencies, and Non-Government Institutions - supporting Compliance, Internal Controls and Risk Management requirements!**
+
+The backend repository for the PROCG web application.
+
+![Python](https://img.shields.io/badge/Python-3.8%2B-blue)
+![Flask](https://img.shields.io/badge/Flask-2.0%2B-green)
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-13%2B-blue)
+![Redis](https://img.shields.io/badge/Redis-6%2B-red)
+![Celery](https://img.shields.io/badge/Celery-5%2B-green)
+
+## Features
+
+- **Core Backend**: Flask-based API with modular Blueprint architecture.
+- **Security**: JWT authentication and Role-Based Access Control (RBAC).
+- **Async Processing**: Celery and Redis for background and scheduled tasks.
+- **Data Management**: PostgreSQL with SQLAlchemy.
+
+## Documentation
+
+For full documentation, including architecture details and API reference, please visit the **[Documentation Hub](docs/index.md)**.
+
+
+## Tech Stack
+
+- **Framework**: Flask
+- **Database**: PostgreSQL, SQLAlchemy
+- **Message Broker / Cache**: Redis
+- **Task Queue**: Celery
+- **Scheduler**: Celery Redbeat
+- **Authentication**: Flask-JWT-Extended
+
+## Prerequisites
+
+Ensure you have the following installed:
+- Python 3.8+
+- Redis Server
+- PostgreSQL
+- **Git LFS**: Required for downloading large driver files located in the `drivers/` folder.
+  ```bash
+  git lfs install
+  git lfs pull
+  ```
+
+## Installation
+
+1.  **Clone the repository:**
+    ```bash
+    git clone <repository-url>
+    cd flask
+    ```
+
+2.  **Create and activate a virtual environment:**
+    ```bash
+    python -m venv procg_venv
+    # Windows
+    procg_venv\Scripts\activate
+    # Linux/Mac
+    source procg_venv/bin/activate
+    ```
+
+3.  **Install dependencies:**
+    ```bash
+    pip install -r requirements.txt
+    ```
+
+4.  **Install local drivers:**
+    Some connectors (like ServiceNow) require proprietary drivers located in the `drivers/` folder. Install them using:
+    ```bash
+    # Windows
+    pip install drivers/cdata_servicenow_connector-25.0.9454-cp311-cp311-win_amd64.whl
+    ```
+
+5.  **Install CData License:**
+    After installing CData connectors, you must activate the license.
+    
+    **Option A: Command Line (Recommended)**
+    Run the registration module for the specific connector:
+    ```bash
+    # For CData Connect
+    python -m cdata.connect.register
+    
+    # For ServiceNow
+    python -m cdata.servicenow.register
+    ```
+    
+    **Option B: GUI License Manager**
+    If the command line method fails, run the license manager executable directly:
+    1. Navigate to `procg_venv\Lib\site-packages\cdata\installlic_connect` (or `installlic_servicenow`).
+    2. Run `install-license.exe`.
+    3. Enter your product key or start a trial.
+
+## Configuration
+
+Create a `.env` file in the root directory with the following variables:
+
+```env
+# Database (Production)
+DATABASE_URL=postgresql://user:password@localhost:5432/dbname
+
+# Database (Test) - Optional, for frontend testing without affecting production
+DATABASE_URL_TEST=postgresql://user:password@localhost:5432/dbname_test
+
+# Redis / Celery
+MESSAGE_BROKER=redis://localhost:6379/0
+FLOWER_URL=http://localhost:5555
+
+# Security
+JWT_SECRET_ACCESS_TOKEN=your_jwt_secret
+CRYPTO_SECRET_KEY=your_crypto_key
+
+# Email
+MAIL_SERVER=smtp.example.com
+MAIL_PORT=587
+EMAIL_USER=your_email@example.com
+EMAIL_PASS=your_email_password
+```
+
+> **Note:** For the full `.env` file, please contact the PROCG Backend team.
+>
+> **Environment Loading:**
+> - For **local testing**, ensure `load_dotenv()` is used to load variables from the `.env` file.
+> - For **production**, use `env_path` or system environment variables directly.
+> - **Files to modify:** `config.py` and `executors/__init__.py`.
+
+### Test Database
+
+The test database (`DATABASE_URL_TEST`) runs alongside production. Use it for:
+- Frontend team testing without affecting production data
+- API development and experimentation
+- Integration testing
+
+
+
+## Running the Application
+
+### 1. Start the Flask Server
+```bash
+flask run
+# OR
+python -m flask run
+```
+The API will be available at `http://localhost:5000`.
+
+### 2. Start the Celery Worker
+To process background tasks:
+```bash
+celery -A executors:celery_app worker --loglevel=info
+```
+
+### 3. Start the Celery Beat (Scheduler)
+To run scheduled tasks:
+```bash
+celery -A executors:celery_app beat --loglevel=info
+```
+
+### Webhook retries (Celery)
+
+Failed webhook deliveries schedule a **per-delivery** Celery task (`redbeat_s.tasks.retry_single_webhook_delivery`) with an `eta` matching `next_retry_date`, so workers do not poll the database every minute.
+
+Beat only runs an **hourly sweeper** (`redbeat_s.tasks.retry_webhooks_task`) for rows that are still `FAILED` and far past `next_retry_date` (e.g. lost broker messages). Tune `SWEEPER_GRACE_SECONDS` and `SWEEPER_BATCH_LIMIT` in [`utils/webhook_service.py`](utils/webhook_service.py) if needed.
+
+**Optional — isolate webhook HTTP work:** add a dedicated queue and consume it explicitly, for example in your Flask/Celery config mapping:
+
+```python
+task_routes={
+    "redbeat_s.tasks.retry_single_webhook_delivery": {"queue": "webhooks"},
+    "redbeat_s.tasks.retry_webhooks_task": {"queue": "webhooks"},
+},
+```
+
+Then start workers with that queue subscribed, e.g. `celery -A executors:celery_app worker -Q celery,webhooks --loglevel=info`.
+
+## Project Structure
+
+- `api/`: Contains all Flask Blueprints (routes and logic).
+- `executors/`: Application factory, extensions, and task execution logic.
+- `redbeat_s/`: Redbeat scheduled task functions.
+- `utils/`: Utility functions.
+- `config.py`: Application configuration.
+- `app.py`: Application entry point.
+
+## Why `flask run` vs `python app.py`?
+
+While you can still run the app using `python app.py` if you add `app.run()` to the bottom of the file, we recommend using `flask run`.
+
+### The Difference
+- **`python app.py`**: Runs the file as a standalone script. It requires you to manually manage the server start logic in your code.
+- **`flask run`**: Uses the official Flask CLI. It automatically finds your application object, handles environment variables (`.env`) more robustly, and provides a cleaner separation between your code and the server.
+
+### What's Better?
+**`flask run` is the modern standard.** It keeps the application entry point clean and is the preferred way to run Flask applications during development.
+

@@ -21,6 +21,5 @@ api/rbac/rbac_sync.py
 .ruff.toml
 implementation_plan.md
 openbao_blueprint.md
-README.md
 user_testing_guide.md
 api_role_mapping.md
